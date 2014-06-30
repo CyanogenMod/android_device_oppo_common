@@ -7,7 +7,14 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.media.IAudioService;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Message;
 import android.os.PowerManager;
 import android.os.RemoteException;
 import android.os.ServiceManager;
@@ -18,6 +25,7 @@ import android.util.Log;
 import android.view.KeyEvent;
 
 import com.android.internal.os.DeviceKeyHandler;
+import com.android.internal.util.ArrayUtils;
 import com.android.internal.util.cm.NavigationRingHelpers;
 import com.android.internal.util.cm.TorchConstants;
 
@@ -34,14 +42,30 @@ public class KeyHandler implements DeviceKeyHandler {
     private static final int GESTURE_GTR_SCANCODE = 254;
     private static final int KEY_DOUBLE_TAP = 255;
 
+    private static final int[] sSupportedGestures = new int[]{
+        FLIP_CAMERA_SCANCODE,
+        GESTURE_CIRCLE_SCANCODE,
+        GESTURE_SWIPE_DOWN_SCANCODE,
+        GESTURE_V_SCANCODE,
+        GESTURE_LTR_SCANCODE,
+        GESTURE_GTR_SCANCODE,
+        KEY_DOUBLE_TAP        
+    };
+
     private Intent mPendingIntent;
     private final Context mContext;
     private final PowerManager mPowerManager;
     private KeyguardManager mKeyguardManager;
+    private EventHandler mEventHandler;
+    private SensorManager mSensorManager;
+    private Sensor mProximitySensor;
 
     public KeyHandler(Context context) {
         mContext = context;
         mPowerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mEventHandler = new EventHandler();
+        mSensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+        mProximitySensor = mSensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY);
 
         IntentFilter filter = new IntentFilter();
         filter.addAction(Intent.ACTION_USER_PRESENT);
@@ -76,49 +100,77 @@ public class KeyHandler implements DeviceKeyHandler {
         }
     };
 
+    private class EventHandler extends Handler {
+
+        @Override
+        public void handleMessage(Message msg) {
+            KeyEvent event = (KeyEvent) msg.obj;
+            switch(event.getScanCode()) {
+            case FLIP_CAMERA_SCANCODE:
+                if (event.getAction() == KeyEvent.ACTION_UP) {
+                    break;
+                }
+            case GESTURE_CIRCLE_SCANCODE:
+                Intent intent = new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA, null);
+                startActivitySafely(intent);
+                break;
+            case GESTURE_SWIPE_DOWN_SCANCODE:
+                dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
+                break;
+            case GESTURE_V_SCANCODE:
+                if (NavigationRingHelpers.isTorchAvailable(mContext)) {
+                    Intent torchIntent = new Intent(TorchConstants.ACTION_TOGGLE_STATE);
+                    mContext.sendBroadcast(torchIntent);
+                }
+                break;
+            case GESTURE_LTR_SCANCODE:
+                dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_PREVIOUS);
+                break;
+            case GESTURE_GTR_SCANCODE:
+                dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_NEXT);
+                break;
+            case KEY_DOUBLE_TAP:
+                if (!mPowerManager.isScreenOn()) {
+                    mPowerManager.wakeUpFromKeyEvent(SystemClock.uptimeMillis());
+                }
+                break;
+            }
+        }
+
+    }
 
     public boolean handleKeyEvent(KeyEvent event) {
         if (event.getAction() != KeyEvent.ACTION_UP && event.getScanCode() != FLIP_CAMERA_SCANCODE) {
             return false;
         }
-        boolean consumed = false;
-        switch(event.getScanCode()) {
-        case FLIP_CAMERA_SCANCODE:
-            if (event.getAction() == KeyEvent.ACTION_UP) {
-                break;
-            }
-        case GESTURE_CIRCLE_SCANCODE:
-            Intent intent = new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA, null);
-            startActivitySafely(intent);
-            consumed = true;
-            break;
-        case GESTURE_SWIPE_DOWN_SCANCODE:
-            dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE);
-            consumed = true;
-            break;
-        case GESTURE_V_SCANCODE:
-            if (NavigationRingHelpers.isTorchAvailable(mContext)) {
-                Intent torchIntent = new Intent(TorchConstants.ACTION_TOGGLE_STATE);
-                mContext.sendBroadcast(torchIntent);
-            }
-            consumed = true;
-            break;
-        case GESTURE_LTR_SCANCODE:
-            dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_PREVIOUS);
-            consumed = true;
-            break;
-        case GESTURE_GTR_SCANCODE:
-            dispatchMediaKeyWithWakeLockToAudioService(KeyEvent.KEYCODE_MEDIA_NEXT);
-            consumed = true;
-            break;
-        case KEY_DOUBLE_TAP:
-            if (!mPowerManager.isScreenOn()) {
-                mPowerManager.wakeUp(SystemClock.uptimeMillis());
-            }
-            consumed = true;
-            break;
+
+        boolean isKeySupported = ArrayUtils.contains(sSupportedGestures, event.getScanCode());
+
+        if (isKeySupported) {
+            processEvent(event);
         }
-        return consumed;
+
+        return isKeySupported;
+    }
+
+    private void processEvent(final KeyEvent keyEvent) {
+        mSensorManager.registerListener(new SensorEventListener() {
+
+            @Override
+            public void onSensorChanged(SensorEvent event) {
+                mEventHandler.removeCallbacksAndMessages(null);
+                if (event.values[0] == mProximitySensor.getMaximumRange()) {
+                    Message msg = mEventHandler.obtainMessage();
+                    msg.obj = keyEvent;
+                    mEventHandler.sendMessage(msg);                    
+                }
+                mSensorManager.unregisterListener(this);
+            }
+
+            @Override
+            public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+            
+        }, mProximitySensor, SensorManager.SENSOR_DELAY_FASTEST);
     }
 
     private IAudioService getAudioService() {
